@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0
+      http://www.kde.org/standards/kcfg/1.0/kcfg.xsd">
+  <kcfgfile name=""/>
+
+  <group name="General">
+    <entry name="serverUrl" type="String">
+      <default></default>
+    </entry>
+    <entry name="username" type="String">
+      <default></default>
+    </entry>
+    <!-- Stored in plain text in plasma-org.kde.plasma.desktop-appletsrc;
+         users should use an app password, not their account password. -->
+    <entry name="password" type="String">
+      <default></default>
+    </entry>
+    <!-- JSON array of { url, name, color }: the lists this instance syncs -->
+    <entry name="lists" type="String">
+      <default></default>
+    </entry>
+    <!-- How the popup groups tasks: created, due, priority, list or alpha -->
+    <entry name="groupBy" type="String">
+      <default>created</default>
+    </entry>
+    <!-- Where new tasks go in the "All lists" view; empty means the first list -->
+    <entry name="defaultList" type="String">
+      <default></default>
+    </entry>
+    <!-- JSON array of list URLs picked as chips in the popup's search field;
+         empty means all lists -->
+    <entry name="viewLists" type="String">
+      <default></default>
+    </entry>
+    <!-- Single-list settings from before multiple lists; main.qml migrates
+         them into `lists` on startup. -->
+    <entry name="listUrl" type="String">
+      <default></default>
+    </entry>
+    <entry name="listName" type="String">
+      <default></default>
+    </entry>
+    <entry name="listColor" type="String">
+      <default></default>
+    </entry>
+    <entry name="syncIntervalMinutes" type="Int">
+      <default>5</default>
+      <min>1</min>
+    </entry>
+  </group>
+</kcfg>
