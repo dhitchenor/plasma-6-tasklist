@@ -34,6 +34,10 @@
     <entry name="viewLists" type="String">
       <default></default>
     </entry>
+    <!-- JSON array of "list URL\ntask UID" keys whose subtasks are folded -->
+    <entry name="collapsedTasks" type="String">
+      <default></default>
+    </entry>
     <!-- Single-list settings from before multiple lists; main.qml migrates
          them into `lists` on startup. -->
     <entry name="listUrl" type="String">

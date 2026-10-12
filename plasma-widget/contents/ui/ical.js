@@ -60,12 +60,13 @@ function splitLine(line) {
             var head = line.substring(0, i)
             var semi = head.indexOf(";")
             return {
-                name: (semi === -1 ? head : head.substring(0, semi)).toUpperCase(),
-                value: line.substring(i + 1)
+              name: (semi === -1 ? head : head.substring(0, semi)).toUpperCase(),
+              params: semi === -1 ? "" : head.substring(semi + 1),
+              value: line.substring(i + 1)
             }
         }
     }
-    return { name: line.toUpperCase(), value: "" }
+    return { name: line.toUpperCase(), params: "", value: "" }
 }
 
 function unescapeText(v) {
@@ -151,6 +152,22 @@ function removeProp(lines, block, name) {
     }
 }
 
+// RELATED-TO defaults to RELTYPE=PARENT (RFC 5545 §3.2.15); CHILD and
+// SIBLING links are ignored, and only the first parent counts.
+function getParentUid(lines, block) {
+    var depth = 0
+    for (var i = block.start + 1; i < block.end; i++) {
+        var p = splitLine(lines[i])
+        if (p.name === "BEGIN") depth++
+        else if (p.name === "END") depth--
+        else if (depth === 0 && p.name === "RELATED-TO" && p.value.trim() !== "") {
+            var reltype = /(?:^|;)RELTYPE=([^;]*)/i.exec(p.params)
+            if (!reltype || reltype[1].replace(/"/g, "").toUpperCase() === "PARENT") return p.value.trim()
+        }
+    }
+    return null
+}
+
 // Returns null when the resource has no VTODO (e.g. an event in a mixed
 // calendar), so callers can remember it without showing it.
 function parseTodo(text) {
@@ -173,7 +190,61 @@ function parseTodo(text) {
         completed: status === "COMPLETED" || (status === "" && hasProp(lines, block, "COMPLETED")),
         createdAt: created.toISOString(),
         due: due ? due.toISOString() : null,
-        priority: priority >= 1 && priority <= 9 ? priority : 0
+        priority: priority >= 1 && priority <= 9 ? priority : 0,
+        parent: getParentUid(lines, block)
+    }
+}
+
+// Splits a TEXT list on commas, leaving escaped ones (\,) inside values
+function splitTextList(value) {
+    var out = []
+    var current = ""
+    for (var i = 0; i < value.length; i++) {
+        if (value[i] === "\\" && i + 1 < value.length) {
+            current += value[i] + value[++i]
+        } else if (value[i] === ",") {
+            out.push(current)
+            current = ""
+        } else {
+            current += value[i]
+        }
+    }
+    out.push(current)
+    return out.map(function(v) { return unescapeText(v).trim() }).filter(function(v) { return v !== "" })
+}
+
+// Fields only the details page needs, read on demand from the cached text
+// rather than stored in the database.
+function parseDetails(text) {
+    var lines = unfold(text)
+    var block = findTodo(lines)
+    if (!block) return null
+
+    function date(name) {
+        var d = parseDateTime(getProp(lines, block, name) || "")
+        return d ? d.toISOString() : null
+    }
+
+    var categories = []
+    var depth = 0
+    for (var i = block.start + 1; i < block.end; i++) {
+        var p = splitLine(lines[i])
+        if (p.name === "BEGIN") depth++
+        else if (p.name === "END") depth--
+        else if (depth === 0 && p.name === "CATEGORIES") categories = categories.concat(splitTextList(p.value))
+    }
+
+    var percent = parseInt(getProp(lines, block, "PERCENT-COMPLETE") || "", 10)
+    return {
+        description: unescapeText(getProp(lines, block, "DESCRIPTION") || ""),
+        location: unescapeText(getProp(lines, block, "LOCATION") || ""),
+        url: (getProp(lines, block, "URL") || "").trim(),
+        status: (getProp(lines, block, "STATUS") || "").toUpperCase(),
+        percent: isNaN(percent) ? null : Math.max(0, Math.min(100, percent)),
+        categories: categories,
+        start: date("DTSTART"),
+        completedAt: date("COMPLETED"),
+        lastModified: date("LAST-MODIFIED")
     }
 }
 
@@ -203,7 +274,7 @@ function setCompleted(text, completed) {
     return serialize(lines)
 }
 
-function createTodo(uid, title, completed, createdAt) {
+function createTodo(uid, title, completed, createdAt, parentUid) {
     var now = new Date()
     var created = createdAt ? new Date(createdAt) : now
     var lines = [
@@ -222,6 +293,9 @@ function createTodo(uid, title, completed, createdAt) {
         lines.push("COMPLETED:" + formatDateTime(now))
         lines.push("PERCENT-COMPLETE:100")
     }
+    // Without RELTYPE, which means PARENT; written this way because it's what
+    // Nextcloud Tasks and tasks.org write.
+    if (parentUid) lines.push("RELATED-TO:" + parentUid)
     lines.push("END:VTODO", "END:VCALENDAR")
     return serialize(lines)
 }

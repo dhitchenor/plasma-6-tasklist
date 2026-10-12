@@ -40,11 +40,13 @@ function getDatabase() {
             tx.executeSql('CREATE TABLE IF NOT EXISTS tasks('
                 + 'list TEXT NOT NULL, uid TEXT NOT NULL, href TEXT, href_key TEXT, etag TEXT, ics TEXT, '
                 + 'kind TEXT, title TEXT, completed INTEGER, created_at TEXT, pending TEXT, '
-                + 'due TEXT, priority INTEGER, '
+                + 'due TEXT, priority INTEGER, parent TEXT, '
                 + 'PRIMARY KEY (list, uid))')
             tx.executeSql('CREATE INDEX IF NOT EXISTS tasks_href_key ON tasks(list, href_key)')
             tx.executeSql('CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)')
-            addDueAndPriority(tx)
+          addDueAndPriority(tx)
+          addParent(tx)
+          tx.executeSql('CREATE INDEX IF NOT EXISTS tasks_parent ON tasks(list, parent)')
         })
     }
     return db
@@ -67,6 +69,24 @@ function addDueAndPriority(tx) {
         if (!todo) continue
         tx.executeSql('UPDATE tasks SET due = ?, priority = ? WHERE list = ? AND uid = ?',
             [todo.due, todo.priority, row.list, row.uid])
+    }
+}
+
+// Same as addDueAndPriority, for the subtask link. Kept separate so a
+// database that already had due/priority still gets this column.
+function addParent(tx) {
+    var columns = tx.executeSql('PRAGMA table_info(tasks)')
+    for (var i = 0; i < columns.rows.length; i++) {
+        if (columns.rows.item(i).name === 'parent') return
+    }
+    tx.executeSql('ALTER TABLE tasks ADD COLUMN parent TEXT')
+    var rs = tx.executeSql("SELECT list, uid, ics FROM tasks WHERE kind = 'todo' AND ics IS NOT NULL")
+    for (var r = 0; r < rs.rows.length; r++) {
+        var row = rs.rows.item(r)
+        var todo = ICal.parseTodo(row.ics)
+        if (todo && todo.parent) {
+            tx.executeSql('UPDATE tasks SET parent = ? WHERE list = ? AND uid = ?', [todo.parent, row.list, row.uid])
+        }
     }
 }
 
@@ -122,7 +142,7 @@ function adoptLocalTasks(localList, list) {
 function getAllTodos(list) {
     var todos = []
     getDatabase().readTransaction(function(tx) {
-        var rs = tx.executeSql("SELECT uid, title, completed, created_at, due, priority FROM tasks "
+        var rs = tx.executeSql("SELECT uid, title, completed, created_at, due, priority, parent FROM tasks "
             + "WHERE list = ? AND kind = 'todo' AND (pending IS NULL OR pending != 'deleted') "
             + "ORDER BY completed ASC, created_at DESC", [list])
         for (var i = 0; i < rs.rows.length; i++) {
@@ -134,49 +154,109 @@ function getAllTodos(list) {
                 completed: row.completed === 1,
                 created_at: row.created_at,
                 due: row.due,
-                priority: row.priority || 0
+                priority: row.priority || 0,
+                parent: row.parent || null
             })
         }
     })
     return todos
 }
 
-function addTodo(list, title) {
+function getTodoDetails(list, uid) {
+    var ics = null
+    getDatabase().readTransaction(function(tx) {
+        var rs = tx.executeSql('SELECT ics FROM tasks WHERE list = ? AND uid = ?', [list, uid])
+        if (rs.rows.length) ics = rs.rows.item(0).ics
+    })
+    return ics ? ICal.parseDetails(ics) : null
+}
+
+function addTodo(list, title, parentUid) {
     var uid = ICal.generateUid()
     var createdAt = new Date().toISOString()
-    var ics = ICal.createTodo(uid, title, false, createdAt)
+    var ics = ICal.createTodo(uid, title, false, createdAt, parentUid || null)
     getDatabase().transaction(function(tx) {
-        tx.executeSql('INSERT INTO tasks (list, uid, ics, kind, title, completed, created_at, pending) '
-            + "VALUES (?, ?, ?, 'todo', ?, 0, ?, 'new')", [list, uid, ics, title, createdAt])
+        tx.executeSql('INSERT INTO tasks (list, uid, ics, kind, title, completed, created_at, pending, parent) '
+            + "VALUES (?, ?, ?, 'todo', ?, 0, ?, 'new', ?)", [list, uid, ics, title, createdAt, parentUid || null])
+        reopenAncestors(tx, list, uid)
     })
     return uid
 }
 
+// Every task below uid, at any depth. `seen` guards against RELATED-TO
+// cycles, which buggy clients can produce and would otherwise loop forever.
+function descendants(tx, list, uid, seen) {
+    seen = seen || {}
+    seen[uid] = true
+    var out = []
+    var rs = tx.executeSql("SELECT uid FROM tasks WHERE list = ? AND parent = ? AND kind = 'todo' "
+        + "AND (pending IS NULL OR pending != 'deleted')", [list, uid])
+    for (var i = 0; i < rs.rows.length; i++) {
+        var child = rs.rows.item(i).uid
+        if (seen[child]) continue
+        out.push(child)
+        out = out.concat(descendants(tx, list, child, seen))
+    }
+    return out
+}
+
+function setCompletedRow(tx, list, uid, completed) {
+    var rs = tx.executeSql('SELECT ics, completed, pending FROM tasks WHERE list = ? AND uid = ?', [list, uid])
+    if (rs.rows.length === 0) return
+    var row = rs.rows.item(0)
+    if ((row.completed === 1) === completed) return
+    tx.executeSql('UPDATE tasks SET ics = ?, completed = ?, pending = ? WHERE list = ? AND uid = ?',
+        [ICal.setCompleted(row.ics, completed), completed ? 1 : 0,
+         row.pending === 'new' ? 'new' : 'modified', list, uid])
+}
+
+// Follows Nextcloud Tasks: completing a task completes its open subtasks,
+// and reopening a subtask reopens its completed parents, so a finished
+// parent never has unfinished work under it.
 function toggleTodo(list, uid) {
     getDatabase().transaction(function(tx) {
-        var rs = tx.executeSql('SELECT ics, completed, pending FROM tasks WHERE list = ? AND uid = ?', [list, uid])
+        var rs = tx.executeSql('SELECT completed FROM tasks WHERE list = ? AND uid = ?', [list, uid])
         if (rs.rows.length === 0) return
-        var row = rs.rows.item(0)
-        var completed = row.completed !== 1
-        var ics = ICal.setCompleted(row.ics, completed)
-        tx.executeSql('UPDATE tasks SET ics = ?, completed = ?, pending = ? WHERE list = ? AND uid = ?',
-            [ics, completed ? 1 : 0, row.pending === 'new' ? 'new' : 'modified', list, uid])
+        var completed = rs.rows.item(0).completed !== 1
+        setCompletedRow(tx, list, uid, completed)
+        if (completed) {
+            descendants(tx, list, uid).forEach(function(child) { setCompletedRow(tx, list, child, true) })
+        } else {
+            reopenAncestors(tx, list, uid)
+        }
     })
 }
 
+function reopenAncestors(tx, list, uid) {
+    var seen = {}
+    seen[uid] = true
+    var rs = tx.executeSql('SELECT parent FROM tasks WHERE list = ? AND uid = ?', [list, uid])
+    var parent = rs.rows.length ? rs.rows.item(0).parent : null
+    while (parent && !seen[parent]) {
+        seen[parent] = true
+        setCompletedRow(tx, list, parent, false)
+        var up = tx.executeSql('SELECT parent FROM tasks WHERE list = ? AND uid = ?', [list, parent])
+        parent = up.rows.length ? up.rows.item(0).parent : null
+    }
+}
+
+// Deletes the task and all its subtasks, which would otherwise be left
+// pointing at a parent that no longer exists.
 function deleteTodo(list, uid) {
     getDatabase().transaction(function(tx) {
-        var rs = tx.executeSql('SELECT href, pending FROM tasks WHERE list = ? AND uid = ?', [list, uid])
-        if (rs.rows.length === 0) return
-        var row = rs.rows.item(0)
-        // A 'new' task with an href may already have been PUT (the upload can
-        // be in flight), so it needs a real DELETE rather than just vanishing
-        // locally, or the next pull would bring it back.
-        if (row.pending === 'new' && !row.href) {
-            tx.executeSql('DELETE FROM tasks WHERE list = ? AND uid = ?', [list, uid])
-        } else {
-            tx.executeSql("UPDATE tasks SET pending = 'deleted' WHERE list = ? AND uid = ?", [list, uid])
-        }
+        [uid].concat(descendants(tx, list, uid)).forEach(function(target) {
+            var rs = tx.executeSql('SELECT href, pending FROM tasks WHERE list = ? AND uid = ?', [list, target])
+            if (rs.rows.length === 0) return
+            var row = rs.rows.item(0)
+            // A 'new' task with an href may already have been PUT (the upload
+            // can be in flight), so it needs a real DELETE rather than just
+            // vanishing locally, or the next pull would bring it back.
+            if (row.pending === 'new' && !row.href) {
+                tx.executeSql('DELETE FROM tasks WHERE list = ? AND uid = ?', [list, target])
+            } else {
+                tx.executeSql("UPDATE tasks SET pending = 'deleted' WHERE list = ? AND uid = ?", [list, target])
+            }
+        })
     })
 }
 
@@ -377,10 +457,10 @@ function storeFetched(list, href, etag, text) {
         if (clash.rows.length && clash.rows.item(0).pending) return
 
         tx.executeSql('INSERT OR REPLACE INTO tasks '
-            + '(list, uid, href, href_key, etag, ics, kind, title, completed, created_at, pending, due, priority) '
-            + 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)',
-            [list, uid, href, key, etag, todo ? text : null, todo ? 'todo' : 'other',
-             todo ? todo.title : null, todo && todo.completed ? 1 : 0, todo ? todo.createdAt : null,
-             todo ? todo.due : null, todo ? todo.priority : 0])
+          + '(list, uid, href, href_key, etag, ics, kind, title, completed, created_at, pending, due, priority, parent) '
+          + 'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)',
+          [list, uid, href, key, etag, todo ? text : null, todo ? 'todo' : 'other',
+           todo ? todo.title : null, todo && todo.completed ? 1 : 0, todo ? todo.createdAt : null,
+           todo ? todo.due : null, todo ? todo.priority : 0, todo ? todo.parent : null])
     })
 }

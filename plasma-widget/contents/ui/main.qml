@@ -57,6 +57,148 @@ PlasmoidItem {
         })
     }
 
+        readonly property bool searching: searchText.trim() !== ""
+
+    function taskKey(todo) { return todo.list + "\n" + todo.id }
+
+    // Parent links between cached tasks, by taskKey. A subtask whose parent
+    // isn't cached in the same list (deleted, or never synced) is top-level.
+    function buildTaskTree(allTodos) {
+        var byKey = {}
+        var parentKey = {}
+        var children = {}
+        allTodos.forEach(function(t) { byKey[taskKey(t)] = t })
+        allTodos.forEach(function(t) {
+            var pk = t.parent ? t.list + "\n" + t.parent : null
+            parentKey[taskKey(t)] = pk && byKey[pk] ? pk : null
+        })
+        // RELATED-TO loops from buggy clients would hide every task in the
+        // loop, since none of them would be top-level; cut each loop once.
+        allTodos.forEach(function(t) {
+            var k = taskKey(t)
+            var seen = {}
+            var p = parentKey[k]
+            while (p) {
+                if (p === k) { parentKey[k] = null; break }
+                if (seen[p]) break
+                seen[p] = true
+                p = parentKey[p]
+            }
+        })
+        for (var k in parentKey) {
+            var p = parentKey[k]
+            if (p) (children[p] = children[p] || []).push(byKey[k])
+        }
+        return { byKey: byKey, parentKey: parentKey, children: children }
+    }
+    readonly property var taskTree: buildTaskTree(allTodos)
+    readonly property bool anySubtasks: Object.keys(taskTree.children).length > 0
+
+    readonly property var collapsed: parseUrls(Plasmoid.configuration.collapsedTasks)
+
+    function toggleCollapsed(key) {
+        var next = collapsed.filter(function(k) { return k !== key && taskTree.byKey[k] })
+        if (collapsed.indexOf(key) === -1) next.push(key)
+        Plasmoid.configuration.collapsedTasks = JSON.stringify(next)
+    }
+
+    // The task new entries are added under, as { list, id, title }; null
+    // adds top-level tasks as before.
+    property var subtaskParent: null
+    onTaskTreeChanged: {
+        if (subtaskParent && !taskTree.byKey[taskKey(subtaskParent)]) subtaskParent = null
+    }
+
+    // Deleting a task with subtasks takes two clicks; this is the task
+    // awaiting the second one.
+    property string confirmDelete: ""
+    Timer {
+        id: confirmDeleteTimer
+        interval: 4000
+        onTriggered: root.confirmDelete = ""
+    }
+
+    // Task shown on the details page, by taskKey; "" shows the list. Back
+    // retraces the parents and subtasks followed from there.
+    property string detailKey: ""
+    property var detailHistory: []
+    readonly property var detailTodo: detailKey !== "" ? (taskTree.byKey[detailKey] || null) : null
+    // Re-read whenever detailTodo changes, which includes every reload, so
+    // the page follows edits synced from other apps.
+    readonly property var detail: detailTodo ? Storage.getTodoDetails(detailTodo.list, detailTodo.id) : null
+
+    // Deleted here or by a sync elsewhere. Deferred: changing detailKey from
+    // inside detailTodo's own change handler is a binding loop.
+    onDetailTodoChanged: {
+        if (detailKey !== "" && !detailTodo) Qt.callLater(function() {
+            if (detailKey !== "" && !detailTodo) goBack()
+        })
+    }
+
+    function openDetails(key) {
+        if (detailKey !== "") detailHistory = detailHistory.concat([detailKey])
+        detailKey = key
+    }
+
+    function goBack() {
+        var history = detailHistory.slice()
+        var next = ""
+        while (history.length > 0 && next === "") {
+            var key = history.pop()
+            if (taskTree.byKey[key]) next = key
+        }
+        detailHistory = history
+        detailKey = next
+    }
+
+    function closeDetails() {
+        detailHistory = []
+        detailKey = ""
+    }
+
+    // Date-only values (all-day dates) parse to local midnight, and showing
+    // "00:00" for those would suggest a time that was never set.
+    function formatDate(iso) {
+        if (!iso) return ""
+        var d = new Date(iso)
+        if (d.getHours() === 0 && d.getMinutes() === 0 && d.getSeconds() === 0) {
+            return d.toLocaleDateString(Qt.locale(), Locale.LongFormat)
+        }
+        return d.toLocaleString(Qt.locale(), Locale.ShortFormat)
+    }
+
+    // [label, value, label, value, …] for the details grid, empty fields left
+    // out. Values are rendered with renderTitle, so they're escaped and any
+    // URLs become links.
+    readonly property var detailFields: {
+        if (!detailTodo || !detail) return []
+        var t = detailTodo
+        var d = detail
+        var out = []
+        function add(label, value) {
+            if (value !== "" && value !== null && value !== undefined) out.push(label, renderTitle(String(value)))
+        }
+        var list = listByUrl(t.list)
+        if (lists.length > 1 && list) add(i18n("List:"), list.name)
+        var status = d.status === "CANCELLED" ? i18n("Cancelled")
+            : d.status === "IN-PROCESS" && !t.completed ? i18n("In progress")
+            : t.completed ? i18n("Completed") : i18n("Open")
+        add(i18n("Status:"), status)
+        if (d.percent !== null && !t.completed) add(i18n("Progress:"), i18n("%1%", d.percent))
+        if (t.priority > 0) {
+            add(i18n("Priority:"), t.priority <= 4 ? i18n("High") : t.priority === 5 ? i18n("Medium") : i18n("Low"))
+        }
+        add(i18n("Due:"), formatDate(t.due))
+        add(i18n("Starts:"), formatDate(d.start))
+        add(i18n("Completed:"), t.completed ? formatDate(d.completedAt) : "")
+        add(i18n("Location:"), d.location)
+        add(i18n("Link:"), d.url)
+        add(i18n("Categories:"), d.categories.join(", "))
+        add(i18n("Created:"), formatDate(t.created_at))
+        add(i18n("Modified:"), formatDate(d.lastModified))
+        return out
+    }
+
     property int syncsRunning: 0
     readonly property bool syncing: syncsRunning > 0
     property var syncErrors: ({})
@@ -184,8 +326,12 @@ PlasmoidItem {
     }
 
     onExpandedChanged: {
-        if (root.expanded) root.syncNow()
-        else root.updateStatus()
+        if (root.expanded) {
+            root.syncNow()
+        } else {
+            root.updateStatus()
+            root.closeDetails()
+        }
     }
 
     function syncNow() {
@@ -228,7 +374,13 @@ PlasmoidItem {
 
     function addTodo(text) {
         if (text.trim() === "") return
-        Storage.addTodo(addTarget, text.trim())
+                if (subtaskParent) {
+            Storage.addTodo(subtaskParent.list, text.trim(), subtaskParent.id)
+            var key = taskKey(subtaskParent)
+            if (collapsed.indexOf(key) !== -1) toggleCollapsed(key)
+        } else {
+            Storage.addTodo(addTarget, text.trim())
+        }
         loadTodos()
         pushDebounce.restart()
     }
@@ -240,6 +392,13 @@ PlasmoidItem {
     }
 
     function deleteTodo(list, id) {
+        var key = list + "\n" + id
+        if ((taskTree.children[key] || []).length > 0 && confirmDelete !== key) {
+            confirmDelete = key
+            confirmDeleteTimer.restart()
+            return
+        }
+        confirmDelete = ""
         Storage.deleteTodo(list, id)
         loadTodos()
         pushDebounce.restart()
@@ -376,40 +535,69 @@ PlasmoidItem {
         return i18n("Due %1", date.toLocaleDateString(Qt.locale(), format))
     }
 
-    // The visible tasks as ordered groups, [{ label, items }]; an empty label
-    // means no heading.
-    function groupTodos() {
-        var todos = getFilteredTodos().slice()
-        var groups = []
+        // The visible tasks as ordered groups, [{ label, items }]; an empty label
+        // means no heading. Each item is { todo, depth, context, subtasks,
+        // subtasksDone, collapsed }.
+        //
+        // Only top-level tasks are grouped; subtasks follow their parent wherever
+        // it lands, so a family is never split across groups.
+        function groupTodos() {
+        // Built here rather than read from taskTree: QML doesn't order binding
+        // updates, so when allTodos changes the list model can be rebuilt
+        // before taskTree is, and a stale tree misses newly added tasks.
+        var tree = buildTaskTree(allTodos)
+        var matching = {}
+        getFilteredTodos().forEach(function(t) { matching[taskKey(t)] = true })
 
-        function bucket(labels, groupOf, compare) {
-            todos.sort(compare)
+        // Parents of matching tasks are shown too, as context, so a subtask
+        // never appears without the task it belongs to.
+        var visible = {}
+        for (var mk in matching) {
+            var p = mk
+            while (p && !visible[p]) {
+                visible[p] = true
+                p = tree.parentKey[p]
+            }
+        }
+        var roots = Object.keys(visible)
+            .filter(function(k) { return !tree.parentKey[k] })
+            .map(function(k) { return tree.byKey[k] })
+
+        var groups = []
+        var compare
+
+        function bucket(labels, groupOf) {
+            roots.sort(compare)
             var buckets = labels.map(function() { return [] })
-            todos.forEach(function(todo) { buckets[groupOf(todo)].push(todo) })
+            roots.forEach(function(todo) { buckets[groupOf(todo)].push(todo) })
             labels.forEach(function(label, i) {
                 if (buckets[i].length > 0) groups.push({ label: label, items: buckets[i] })
             })
         }
 
         if (groupBy === "due") {
+            compare = chainCompare(openFirst, earliestDueFirst, newestFirst)
             bucket([i18n("Overdue"), i18n("Today"), i18n("This week"), i18n("Later"), i18n("No due date"), i18n("Earlier")],
-                dueGroup, chainCompare(openFirst, earliestDueFirst, newestFirst))
+                dueGroup)
         } else if (groupBy === "priority") {
+            compare = chainCompare(openFirst, earliestDueFirst, newestFirst)
             bucket([i18n("High priority"), i18n("Medium priority"), i18n("Low priority"), i18n("No priority")],
-                priorityGroup, chainCompare(openFirst, earliestDueFirst, newestFirst))
+                priorityGroup)
         } else if (groupBy === "list") {
+            compare = chainCompare(openFirst, newestFirst)
             var urls = synced ? lists.map(function(l) { return l.url }) : [localList]
             var names = synced ? lists.map(function(l) { return l.name }) : [i18n("On this computer")]
-            bucket(names, function(todo) { return Math.max(0, urls.indexOf(todo.list)) },
-                chainCompare(openFirst, newestFirst))
+            bucket(names, function(todo) { return Math.max(0, urls.indexOf(todo.list)) })
         } else if (groupBy === "alpha") {
-            todos.sort(chainCompare(openFirst, function(a, b) { return a.title.localeCompare(b.title) }))
-            groups.push({ label: "", items: todos })
+            compare = chainCompare(openFirst, function(a, b) { return a.title.localeCompare(b.title) })
+            roots.sort(compare)
+            groups.push({ label: "", items: roots })
         } else {
             // By date added: groups appear in the order their newest task does
-            todos.sort(chainCompare(openFirst, newestFirst))
+            compare = chainCompare(openFirst, newestFirst)
+            roots.sort(compare)
             var index = {}
-            todos.forEach(function(todo) {
+            roots.forEach(function(todo) {
                 var label = getDateLabel(todo.created_at)
                 if (!(label in index)) {
                     index[label] = groups.length
@@ -418,6 +606,31 @@ PlasmoidItem {
                 groups[index[label]].items.push(todo)
             })
         }
+
+        groups.forEach(function(group) {
+            var out = []
+            function visit(todo, depth) {
+                var key = taskKey(todo)
+                var kids = tree.children[key] || []
+                // Collapsing is ignored while searching, or matches inside a
+                // collapsed task would be hidden.
+                var folded = !searching && kids.length > 0 && collapsed.indexOf(key) !== -1
+                out.push({
+                    todo: todo,
+                    depth: depth,
+                    context: !matching[key],
+                    subtasks: kids.length,
+                    subtasksDone: kids.filter(function(c) { return c.completed }).length,
+                    collapsed: folded
+                })
+                if (folded) return
+                kids.filter(function(c) { return visible[taskKey(c)] })
+                    .sort(compare)
+                    .forEach(function(c) { visit(c, depth + 1) })
+            }
+            group.items.forEach(function(todo) { visit(todo, 0) })
+            group.items = out
+        })
         return groups
     }
 
@@ -472,6 +685,7 @@ PlasmoidItem {
 
         // Header
         Rectangle {
+            visible: root.detailKey === ""
             Layout.fillWidth: true
             Layout.preferredHeight: headerColumn.implicitHeight + Kirigami.Units.largeSpacing * 2
             color: Kirigami.Theme.backgroundColor
@@ -579,6 +793,16 @@ PlasmoidItem {
                     }
                 }
 
+                Kirigami.Chip {
+                    visible: root.subtaskParent !== null
+                    Layout.maximumWidth: parent.width
+                    text: root.subtaskParent ? i18n("Subtask of: %1", root.subtaskParent.title) : ""
+                    icon.name: "view-list-tree"
+                    checkable: false
+                    closable: true
+                    onRemoved: root.subtaskParent = null
+                }
+
                 // Input field with Add button
                 RowLayout {
                     Layout.fillWidth: true
@@ -588,9 +812,22 @@ PlasmoidItem {
                         id: inputField
                         Layout.fillWidth: true
                         Layout.preferredHeight: Kirigami.Units.gridUnit * 2.5
-                        placeholderText: root.mixedView
-                            ? i18n("Add a task to %1…", root.listByUrl(root.addTarget).name)
+                        placeholderText: root.subtaskParent ? i18n("Add a subtask…")
+                            : root.mixedView ? i18n("Add a task to %1…", root.listByUrl(root.addTarget).name)
                             : i18n("Add a task…")
+
+                        Keys.onEscapePressed: function(event) {
+                            event.accepted = root.subtaskParent !== null
+                            root.subtaskParent = null
+                        }
+
+                        Connections {
+                            target: root
+                            function onSubtaskParentChanged() {
+                                if (root.subtaskParent) inputField.forceActiveFocus()
+                            }
+                        }
+
                         leftPadding: Kirigami.Units.largeSpacing
                         rightPadding: Kirigami.Units.largeSpacing
 
@@ -687,6 +924,7 @@ PlasmoidItem {
 
         // Separator
         Kirigami.Separator {
+            visible: root.detailKey === ""
             Layout.fillWidth: true
         }
 
@@ -702,6 +940,7 @@ PlasmoidItem {
 
         // Todo list
         QQC2.ScrollView {
+            visible: root.detailKey === ""
             Layout.fillWidth: true
             Layout.fillHeight: true
 
@@ -714,7 +953,12 @@ PlasmoidItem {
                     const items = []
                     root.groupTodos().forEach(function(group) {
                         if (group.label !== "") items.push({ type: "header", text: group.label })
-                        group.items.forEach(function(todo) { items.push({ type: "todo", data: todo }) })
+                        group.items.forEach(function(entry) {
+                            items.push({
+                                type: "todo", data: entry.todo, depth: entry.depth, context: entry.context,
+                                subtasks: entry.subtasks, subtasksDone: entry.subtasksDone, collapsed: entry.collapsed
+                            })
+                        })
                     })
                     return items
                 }
@@ -724,6 +968,178 @@ PlasmoidItem {
                     sourceComponent: modelData.type === "header" ? headerComponent : todoComponent
 
                     property var itemData: modelData
+                }
+            }
+        }
+
+        // Task details, in place of the header and list while open
+        ColumnLayout {
+            visible: root.detailTodo !== null
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            spacing: 0
+
+            RowLayout {
+                Layout.fillWidth: true
+                Layout.margins: Kirigami.Units.smallSpacing
+
+                PlasmaComponents.ToolButton {
+                    icon.name: Qt.application.layoutDirection === Qt.RightToLeft ? "go-next" : "go-previous"
+                    text: i18n("Back")
+                    onClicked: root.goBack()
+                }
+
+                Item { Layout.fillWidth: true }
+
+                PlasmaComponents.ToolButton {
+                    icon.name: "list-add"
+                    text: i18n("Add subtask")
+                    display: QQC2.AbstractButton.IconOnly
+                    onClicked: {
+                        root.subtaskParent = {
+                            list: root.detailTodo.list, id: root.detailTodo.id, title: root.detailTodo.title
+                        }
+                        root.closeDetails()
+                    }
+                    PlasmaComponents.ToolTip { text: parent.text }
+                }
+
+                PlasmaComponents.ToolButton {
+                    readonly property int subtasks: root.detailTodo ? (root.taskTree.children[root.detailKey] || []).length : 0
+                    readonly property bool confirming: root.confirmDelete === root.detailKey
+                    icon.name: "edit-delete"
+                    icon.color: confirming ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.textColor
+                    text: confirming ? i18np("Delete with %1 subtask?", "Delete with %1 subtasks?", subtasks)
+                                     : i18n("Delete")
+                    display: confirming ? QQC2.AbstractButton.TextBesideIcon : QQC2.AbstractButton.IconOnly
+                    onClicked: root.deleteTodo(root.detailTodo.list, root.detailTodo.id)
+                }
+            }
+
+            Kirigami.Separator { Layout.fillWidth: true }
+
+            QQC2.ScrollView {
+                id: detailScroll
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                contentWidth: availableWidth
+
+                ColumnLayout {
+                    x: Kirigami.Units.largeSpacing
+                    width: detailScroll.availableWidth - Kirigami.Units.largeSpacing * 2
+                    spacing: Kirigami.Units.largeSpacing
+
+                    Item { Layout.preferredHeight: Kirigami.Units.smallSpacing }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: Kirigami.Units.smallSpacing
+
+                        QQC2.CheckBox {
+                            Layout.alignment: Qt.AlignTop
+                            checked: root.detailTodo ? root.detailTodo.completed : false
+                            onClicked: root.toggleTodo(root.detailTodo.list, root.detailTodo.id)
+                        }
+
+                        Kirigami.Heading {
+                            Layout.fillWidth: true
+                            level: 3
+                            text: root.detailTodo ? root.renderTitle(root.detailTodo.title) : ""
+                            textFormat: Text.RichText
+                            wrapMode: Text.Wrap
+                            font.strikeout: root.detailTodo ? root.detailTodo.completed : false
+                            onLinkActivated: function(link) { Qt.openUrlExternally(link) }
+                        }
+                    }
+
+                    PlasmaComponents.Label {
+                        readonly property string parentKey: root.detailKey !== "" ? (root.taskTree.parentKey[root.detailKey] || "") : ""
+                        visible: parentKey !== ""
+                        Layout.fillWidth: true
+                        wrapMode: Text.Wrap
+                        textFormat: Text.RichText
+                        text: parentKey !== ""
+                            ? i18n("Subtask of %1", '<a href="#">' + root.renderTitle(root.taskTree.byKey[parentKey].title) + '</a>')
+                            : ""
+                        onLinkActivated: root.openDetails(parentKey)
+                    }
+
+                    GridLayout {
+                        Layout.fillWidth: true
+                        columns: 2
+                        columnSpacing: Kirigami.Units.largeSpacing
+                        rowSpacing: Kirigami.Units.smallSpacing
+
+                        Repeater {
+                            model: root.detailFields
+
+                            PlasmaComponents.Label {
+                                readonly property bool isLabel: index % 2 === 0
+                                Layout.alignment: isLabel ? (Qt.AlignRight | Qt.AlignTop) : (Qt.AlignLeft | Qt.AlignTop)
+                                Layout.fillWidth: !isLabel
+                                text: modelData
+                                textFormat: isLabel ? Text.PlainText : Text.RichText
+                                wrapMode: isLabel ? Text.NoWrap : Text.Wrap
+                                color: isLabel ? Kirigami.Theme.disabledTextColor : Kirigami.Theme.textColor
+                                onLinkActivated: function(link) { Qt.openUrlExternally(link) }
+                            }
+                        }
+                    }
+
+                    PlasmaComponents.Label {
+                        visible: root.detail !== null && root.detail.description !== ""
+                        Layout.fillWidth: true
+                        wrapMode: Text.Wrap
+                        textFormat: Text.RichText
+                        text: root.detail ? root.renderTitle(root.detail.description).replace(/\n/g, "<br>") : ""
+                        onLinkActivated: function(link) { Qt.openUrlExternally(link) }
+                    }
+
+                    Kirigami.Heading {
+                        readonly property var kids: root.detailKey !== "" ? (root.taskTree.children[root.detailKey] || []) : []
+                        visible: kids.length > 0
+                        level: 4
+                        text: i18n("Subtasks %1/%2", kids.filter(function(c) { return c.completed }).length, kids.length)
+                    }
+
+                    Repeater {
+                        model: root.detailKey !== ""
+                            ? (root.taskTree.children[root.detailKey] || []).slice()
+                                .sort(root.chainCompare(root.openFirst, root.newestFirst))
+                            : []
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: Kirigami.Units.smallSpacing
+
+                            QQC2.CheckBox {
+                                checked: modelData.completed
+                                onClicked: root.toggleTodo(modelData.list, modelData.id)
+                            }
+
+                            PlasmaComponents.Label {
+                                Layout.fillWidth: true
+                                text: modelData.title
+                                elide: Text.ElideRight
+                                font.strikeout: modelData.completed
+                                color: modelData.completed ? Kirigami.Theme.disabledTextColor : Kirigami.Theme.textColor
+
+                                MouseArea {
+                                    anchors.fill: parent
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: root.openDetails(root.taskKey(modelData))
+                                }
+                            }
+
+                            PlasmaComponents.Label {
+                                visible: (root.taskTree.children[root.taskKey(modelData)] || []).length > 0
+                                text: "›"
+                                color: Kirigami.Theme.disabledTextColor
+                            }
+                        }
+                    }
+
+                    Item { Layout.preferredHeight: Kirigami.Units.smallSpacing }
                 }
             }
         }
@@ -749,11 +1165,39 @@ PlasmoidItem {
     Component {
         id: todoComponent
 
-        PlasmaComponents.ItemDelegate {
+                PlasmaComponents.ItemDelegate {
+            id: row
             height: Kirigami.Units.gridUnit * 3
+            // Shown only because a subtask matches the search or filter
+            opacity: itemData.context ? 0.6 : 1
+
+            readonly property string key: root.taskKey(itemData.data)
+
+
+            // The checkbox, buttons and links take their own clicks first
+            onClicked: root.openDetails(key)
 
             contentItem: RowLayout {
                 spacing: Kirigami.Units.largeSpacing
+
+                Item {
+                    visible: itemData.depth > 0
+                    Layout.preferredWidth: itemData.depth * Kirigami.Units.gridUnit * 1.5
+                }
+
+                // Present on every row once any task has subtasks, but only
+                // usable on those that do, so checkboxes stay aligned.
+                PlasmaComponents.ToolButton {
+                    visible: root.anySubtasks
+                    opacity: itemData.subtasks > 0 ? 1 : 0
+                    enabled: itemData.subtasks > 0 && !root.searching
+                    icon.name: itemData.collapsed
+                        ? (Qt.application.layoutDirection === Qt.RightToLeft ? "go-previous" : "go-next")
+                        : "go-down"
+                    icon.width: Kirigami.Units.iconSizes.small
+                    icon.height: Kirigami.Units.iconSizes.small
+                    onClicked: root.toggleCollapsed(row.key)
+                }
 
                 // Checkbox using system colors
                 QQC2.CheckBox {
@@ -795,17 +1239,41 @@ PlasmoidItem {
 
                 PlasmaComponents.Label {
                     Layout.alignment: Qt.AlignVCenter
+                    visible: itemData.subtasks > 0
+                    text: itemData.subtasksDone + "/" + itemData.subtasks
+                    font: Kirigami.Theme.smallFont
+                    color: Kirigami.Theme.disabledTextColor
+                }
+
+                PlasmaComponents.Label {
+                    Layout.alignment: Qt.AlignVCenter
                     visible: text !== ""
                     text: root.dueText(itemData.data)
                     font: Kirigami.Theme.smallFont
                     color: root.isOverdue(itemData.data) ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.disabledTextColor
                 }
 
-                // Delete button
                 PlasmaComponents.ToolButton {
+                    icon.name: "list-add"
+                    icon.width: Kirigami.Units.iconSizes.small
+                    icon.height: Kirigami.Units.iconSizes.small
+                    text: i18n("Add subtask")
+                    display: QQC2.AbstractButton.IconOnly
+                    onClicked: root.subtaskParent = {
+                        list: itemData.data.list, id: itemData.data.id, title: itemData.data.title
+                    }
+                    PlasmaComponents.ToolTip { text: parent.text }
+                }
+
+                PlasmaComponents.ToolButton {
+                    readonly property bool confirming: root.confirmDelete === row.key
                     icon.name: "edit-delete"
                     icon.width: Kirigami.Units.iconSizes.small
                     icon.height: Kirigami.Units.iconSizes.small
+                    icon.color: confirming ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.textColor
+                    text: confirming ? i18np("Delete with %1 subtask?", "Delete with %1 subtasks?", itemData.subtasks)
+                                     : i18n("Delete")
+                    display: confirming ? QQC2.AbstractButton.TextBesideIcon : QQC2.AbstractButton.IconOnly
                     onClicked: root.deleteTodo(itemData.data.list, itemData.data.id)
                 }
             }
